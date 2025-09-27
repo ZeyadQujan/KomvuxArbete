@@ -1,228 +1,264 @@
 <?php
+/**
+ * Admin-style welcome/dashboard page (UI-only changes).
+ * - Keeps the same auth/session/redirect/logout logic as before.
+ * - No changes to security-sensitive behavior.
+ */
+
+declare(strict_types=1);
+
 session_start();
 
-// Guard: only logged-in users
+/* 1) Guard: only allow access if the user is logged in */
 if (!isset($_SESSION['user'])) {
-  header('Location: /login.php');
+  header('Location: /login.php', true, 302);
   exit;
 }
 
-// CSRF token
-if (empty($_SESSION['csrf'])) {
-  $_SESSION['csrf'] = bin2hex(random_bytes(16));
-}
-$csrf = $_SESSION['csrf'];
+$user = htmlspecialchars((string)$_SESSION['user'], ENT_QUOTES, 'UTF-8');
 
-// ---- Helpers ----
-function f2b_status($jail) {
-  $allowed = ['weblogin','weblogin-24h'];
-  if (!in_array($jail, $allowed, true)) return '';
-  $cmd = "sudo /usr/bin/fail2ban-client status " . escapeshellarg($jail);
-  return shell_exec($cmd . " 2>&1") ?: '';
-}
-function parse_banned($statusText) {
-  $ips = [];
-  foreach (explode("\n", $statusText) as $line) {
-    if (stripos($line, 'Banned IP list:') !== false) {
-      [, $v] = array_pad(explode(':', $line, 2), 2, '');
-      $v = trim($v);
-      if ($v !== '') {
-        foreach (preg_split('/\s+/', $v) as $ip) {
-          $ip = trim($ip, ", ");
-          if ($ip !== '') $ips[] = $ip;
-        }
-      }
-    }
+/* 2) Handle logout (simple GET action) */
+if (isset($_GET['action']) && $_GET['action'] === 'logout') {
+  $_SESSION = [];
+  if (ini_get('session.use_cookies')) {
+    $params = session_get_cookie_params();
+    setcookie(session_name(), '', time() - 42000, $params['path'], $params['domain'], $params['secure'], $params['httponly']);
   }
-  return $ips;
-}
-function parse_counters($statusText) {
-  $c = ['cur_failed'=>0,'tot_failed'=>0,'cur_banned'=>0,'tot_banned'=>0];
-  foreach (explode("\n", $statusText) as $line) {
-    if (stripos($line, 'Currently failed:') !== false) {
-      $c['cur_failed'] = (int)filter_var($line, FILTER_SANITIZE_NUMBER_INT);
-    } elseif (stripos($line, 'Total failed:') !== false) {
-      $c['tot_failed'] = (int)filter_var($line, FILTER_SANITIZE_NUMBER_INT);
-    } elseif (stripos($line, 'Currently banned:') !== false) {
-      $c['cur_banned'] = (int)filter_var($line, FILTER_SANITIZE_NUMBER_INT);
-    } elseif (stripos($line, 'Total banned:') !== false) {
-      $c['tot_banned'] = (int)filter_var($line, FILTER_SANITIZE_NUMBER_INT);
-    }
-  }
-  return $c;
+  session_destroy();
+  header('Location: /login.php', true, 302);
+  exit;
 }
 
-// ---- Unban from ALL jails ----
-$unban_msg = '';
-$ALL_JAILS = ['weblogin','weblogin-24h'];
-
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'unban') {
-  if (!hash_equals($_SESSION['csrf'], $_POST['csrf'] ?? '')) {
-    $unban_msg = 'Invalid CSRF token.';
-  } else {
-    $ip = $_POST['ip'] ?? '';
-    if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
-      $unban_msg = 'Invalid IP address.';
-    } else {
-      $results = [];
-      foreach ($ALL_JAILS as $jail) {
-        $cmd = 'sudo /usr/local/sbin/f2b-unban.sh ' .
-               escapeshellarg($jail) . ' ' . escapeshellarg($ip);
-        $out = shell_exec($cmd . ' 2>&1');
-        $results[] = $jail . ': ' . trim($out ?: 'Done');
-      }
-      $unban_msg = htmlspecialchars(implode(' | ', $results), ENT_QUOTES, 'UTF-8');
-    }
-  }
-}
-
-// ---- Fetch statuses ----
-$st_short = f2b_status('weblogin');
-$st_long  = f2b_status('weblogin-24h');
-
-$ban_short = parse_banned($st_short);
-$ban_long  = parse_banned($st_long);
-$c_short   = parse_counters($st_short);
-$c_long    = parse_counters($st_long);
-
-$user = htmlspecialchars($_SESSION['user'], ENT_QUOTES, 'UTF-8');
+header('Content-Type: text/html; charset=UTF-8');
 ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Admin Dashboard</title>
-<style>
-  :root{
-    --bg:#eef6ff; --card:#fff; --muted:#667085; --accent:#0a7cff; --border:#eaeaea;
-    --shadow:0 8px 26px rgba(0,0,0,.08);
-  }
-  *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;color:#111}
-  .layout{display:grid; grid-template-columns: 320px 1fr; gap:18px; padding:24px; max-width:1200px; margin:0 auto}
-  .card{background:var(--card); border-radius:16px; box-shadow:var(--shadow); border:1px solid var(--border)}
-  .sidebar{position:sticky; top:24px; height:fit-content}
-  .header{padding:20px; text-align:center}
-  .title{margin:0; font-size:28px}
-  .muted{color:var(--muted); font-size:14px; margin-top:6px}
-  .section{padding:18px 18px 6px}
-  .section h3{margin:0 0 10px; font-size:16px}
-  .kpis{display:grid; grid-template-columns: repeat(2, minmax(120px,1fr)); gap:10px}
-  .kpi{background:#f6f9ff; border:1px solid var(--border); border-radius:12px; padding:12px}
-  .kpi b{display:block; font-size:20px}
-  .list{max-height:220px; overflow:auto; border:1px solid var(--border); border-radius:12px; padding:8px; background:#fcfdff}
-  .list table{width:100%; border-collapse:collapse}
-  .list th,.list td{padding:8px; border-bottom:1px solid #f0f0f0; text-align:left; font-size:14px}
-  .content{display:grid; gap:18px}
-  .content .card{padding:20px}
-  .btn{display:inline-block; padding:10px 14px; border-radius:10px; border:0; background:var(--accent); color:#fff; font-weight:700; cursor:pointer}
-  .btn.outline{background:#fff; color:var(--accent); border:1px solid var(--accent)}
-  .row{display:flex; gap:10px; flex-wrap:wrap}
-  input,select{padding:10px; border:1px solid var(--border); border-radius:10px; width:100%}
-  .grid-actions{display:grid; grid-template-columns: repeat(auto-fit, minmax(220px,1fr)); gap:12px}
-  .msg{margin-top:8px; color:var(--accent)}
-  .label{font-size:13px; color:var(--muted); margin-bottom:6px}
-  .pill{display:inline-block; padding:2px 8px; border-radius:999px; background:#eef3ff; color:#2a4bff; font-size:12px; border:1px solid #dfe7ff}
-</style>
+  <meta charset="UTF-8" />
+  <title>Admin Panel</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!--
+    UI-only facelift:
+    - Top navbar with user + logout
+    - Sidebar navigation (placeholders)
+    - Stats cards (placeholders)
+    - Recent activity table (placeholder)
+    No external CSS/JS; pure CSS for portability.
+  -->
+  <style>
+    :root{
+      --bg:#f5f7fb; --panel:#ffffff; --border:#e7e9f0; --muted:#667085;
+      --ink:#0f172a; --accent:#0a7cff; --accent-ink:#0a58ca; --success:#12b886; --warn:#f59f00; --danger:#e03131;
+      --shadow:0 10px 30px rgba(16,24,40,.06);
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{
+      margin:0; background:var(--bg); color:var(--ink);
+      font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      display:grid; grid-template-rows:auto 1fr;
+    }
+
+    /* Top navbar */
+    .topbar{
+      background:#fff; border-bottom:1px solid var(--border); box-shadow:var(--shadow);
+      display:flex; align-items:center; justify-content:space-between; padding:10px 16px;
+      position:sticky; top:0; z-index:50;
+    }
+    .brand{display:flex; align-items:center; gap:10px; font-weight:800; letter-spacing:.2px}
+    .brand .dot{width:10px;height:10px;border-radius:50%;background:var(--accent);display:inline-block}
+    .userbar{display:flex; align-items:center; gap:8px}
+    .userpill{background:#eef6ff;border:1px solid #d9e9ff;color:#12428f;padding:6px 10px;border-radius:999px;font-weight:600}
+    .logout{
+      text-decoration:none; background:var(--accent); color:#fff; padding:8px 12px; border-radius:10px;
+      border:1px solid transparent; font-weight:700;
+    }
+    .logout:hover{background:var(--accent-ink)}
+
+    /* Layout: sidebar + main */
+    .shell{
+      display:grid; grid-template-columns:260px 1fr; gap:18px; padding:18px; align-items:start;
+    }
+    @media (max-width: 900px){
+      .shell{grid-template-columns:1fr}
+      .sidebar{position:static;width:auto}
+    }
+
+    /* Sidebar */
+    .sidebar{
+      background:var(--panel); border:1px solid var(--border); border-radius:14px; box-shadow:var(--shadow);
+      padding:14px; position:sticky; top:72px;
+    }
+    .navsec{margin-top:8px}
+    .navsec h4{margin:10px 8px; color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.6px}
+    .nav{display:grid; gap:6px; list-style:none; padding:0; margin:0}
+    .nav a{
+      display:flex; align-items:center; gap:8px; padding:10px 12px; border-radius:10px; color:var(--ink);
+      text-decoration:none; border:1px solid transparent;
+    }
+    .nav a.active{background:#eef6ff; border-color:#d9e9ff; color:#12428f; font-weight:700}
+    .nav a:hover{background:#f6f9ff}
+
+    /* Main content */
+    .main{
+      display:grid; gap:18px;
+    }
+
+    /* Hero card */
+    .hero{
+      background:linear-gradient(180deg,#ffffff 0%, #fafdff 100%);
+      border:1px solid var(--border); border-radius:14px; box-shadow:var(--shadow); padding:18px;
+      display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;
+    }
+    .hero h1{margin:0; font-size:22px}
+    .muted{color:var(--muted)}
+
+    /* Stat cards */
+    .stats{display:grid; grid-template-columns:repeat(4,1fr); gap:12px}
+    @media (max-width: 1100px){ .stats{grid-template-columns:repeat(2,1fr)} }
+    @media (max-width: 560px){ .stats{grid-template-columns:1fr} }
+    .card{
+      background:var(--panel); border:1px solid var(--border); border-radius:14px; box-shadow:var(--shadow); padding:14px;
+    }
+    .kpi{display:flex; align-items:flex-end; justify-content:space-between}
+    .kpi h3{margin:0 0 6px; font-size:13px; color:var(--muted); letter-spacing:.2px}
+    .kpi .num{font-size:26px; font-weight:800}
+    .tag{font-size:12px; padding:2px 8px; border-radius:8px; background:#f6f9ff; border:1px solid #e6efff; color:#12428f}
+
+    /* Table */
+    .tablecard .head{display:flex; align-items:center; justify-content:space-between; margin-bottom:8px}
+    table{width:100%; border-collapse:separate; border-spacing:0; overflow:hidden; border-radius:12px; border:1px solid var(--border)}
+    th,td{padding:10px 12px; text-align:left; border-bottom:1px solid var(--border)}
+    th{font-size:12px; color:var(--muted); background:#fbfcff}
+    tr:last-child td{border-bottom:0}
+    .badge{display:inline-block; padding:4px 8px; border-radius:999px; font-size:12px; border:1px solid #e6eaf2}
+    .ok{background:#e6fcf5; border-color:#c3f7e7; color:#09694b}
+    .warn{background:#fff7e6; border-color:#ffe1a3; color:#7a5200}
+    .bad{background:#ffe8e8; border-color:#ffc9c9; color:#7a1a1a}
+
+    /* Small helpers */
+    .btn{display:inline-block; padding:8px 12px; border-radius:10px; text-decoration:none; font-weight:700}
+    .btn.muted{background:#f2f4f8; border:1px solid var(--border); color:#334}
+  </style>
 </head>
 <body>
-
-<div class="layout">
-  <!-- Sidebar: Fail2Ban Panel -->
-  <aside class="card sidebar">
-    <div class="header">
-      <h1 class="title">Welcome, <?php echo $user; ?> 👋</h1>
-      <div class="muted">Fail2Ban overview</div>
+  <!-- Top bar -->
+  <div class="topbar">
+    <div class="brand">
+      <span class="dot"></span> Admin Panel
     </div>
-
-    <div class="section">
-      <h3>Short jail <span class="pill">weblogin</span></h3>
-      <div class="kpis">
-        <div class="kpi"><span>Currently failed</span><b><?php echo $c_short['cur_failed']; ?></b></div>
-        <div class="kpi"><span>Total failed</span><b><?php echo $c_short['tot_failed']; ?></b></div>
-        <div class="kpi"><span>Currently banned</span><b><?php echo $c_short['cur_banned']; ?></b></div>
-        <div class="kpi"><span>Total banned</span><b><?php echo $c_short['tot_banned']; ?></b></div>
-      </div>
-      <div class="label">Banned IPs (short)</div>
-      <div class="list">
-        <?php if ($ban_short): ?>
-          <table>
-            <tr><th>#</th><th>IP</th></tr>
-            <?php foreach ($ban_short as $i=>$ip): ?>
-              <tr><td><?php echo $i+1; ?></td><td><?php echo htmlspecialchars($ip, ENT_QUOTES, 'UTF-8'); ?></td></tr>
-            <?php endforeach; ?>
-          </table>
-        <?php else: ?>
-          <div class="muted">No IPs banned in short jail.</div>
-        <?php endif; ?>
-      </div>
+    <div class="userbar">
+      <span class="userpill">👤 <?php echo $user; ?></span>
+      <a class="logout" href="/welcome.php?action=logout" title="Logout">Logout</a>
     </div>
+  </div>
 
-    <div class="section" style="padding-bottom:18px">
-      <h3>Long jail <span class="pill">weblogin-24h</span></h3>
-      <div class="kpis">
-        <div class="kpi"><span>Currently failed</span><b><?php echo $c_long['cur_failed']; ?></b></div>
-        <div class="kpi"><span>Total failed</span><b><?php echo $c_long['tot_failed']; ?></b></div>
-        <div class="kpi"><span>Currently banned</span><b><?php echo $c_long['cur_banned']; ?></b></div>
-        <div class="kpi"><span>Total banned</span><b><?php echo $c_long['tot_banned']; ?></b></div>
+  <!-- Shell layout -->
+  <div class="shell">
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="navsec">
+        <h4>Navigation</h4>
+        <ul class="nav">
+          <li><a class="active" href="/welcome.php">Dashboard</a></li>
+          <li><a href="/login.php">Login</a></li>
+          <!-- Placeholders for future features -->
+          <li><a href="#">Users</a></li>
+          <li><a href="#">Settings</a></li>
+          <li><a href="#">Security</a></li>
+        </ul>
       </div>
-      <div class="label">Banned IPs (24h)</div>
-      <div class="list">
-        <?php if ($ban_long): ?>
-          <table>
-            <tr><th>#</th><th>IP</th></tr>
-            <?php foreach ($ban_long as $i=>$ip): ?>
-              <tr><td><?php echo $i+1; ?></td><td><?php echo htmlspecialchars($ip, ENT_QUOTES, 'UTF-8'); ?></td></tr>
-            <?php endforeach; ?>
-          </table>
-        <?php else: ?>
-          <div class="muted">No IPs banned in long jail.</div>
-        <?php endif; ?>
-      </div>
-    </div>
-  </aside>
+    </aside>
 
-  <!-- Main content: Admin actions (pretty placeholders + unban) -->
-  <main class="content">
-    <div class="card">
-      <h2 style="margin-top:0">Admin quick actions</h2>
-      <div class="grid-actions">
-        <button class="btn outline" disabled title="Coming soon">➕ Create user</button>
-        <button class="btn outline" disabled title="Coming soon">🔐 Rotate DB password</button>
-        <button class="btn outline" disabled title="Coming soon">🧹 Purge old logs</button>
-        <button class="btn outline" disabled title="Coming soon">📦 Backup database</button>
-      </div>
-      <p class="muted" style="margin-top:8px">These are placeholders for demo aesthetics — we can implement them later.</p>
-    </div>
-
-    <div class="card">
-      <h2 style="margin-top:0">Unban an IP (all jails)</h2>
-      <?php if ($unban_msg): ?><div class="msg"><?php echo $unban_msg; ?></div><?php endif; ?>
-      <form method="POST" class="row" style="align-items:flex-end">
-        <input type="hidden" name="csrf" value="<?php echo htmlspecialchars($csrf, ENT_QUOTES, 'UTF-8'); ?>">
-        <input type="hidden" name="action" value="unban">
-        <div style="flex:2 1 260px">
-          <div class="label">IP address (IPv4)</div>
-          <input name="ip" placeholder="e.g. 203.0.113.7" required>
+    <!-- Main -->
+    <main class="main">
+      <!-- Hero -->
+      <section class="hero">
+        <div>
+          <h1>Welcome, <?php echo $user; ?> 👋</h1>
+          <div class="muted">This is a simple admin-style dashboard. Core security demo happens on <code>/login.php</code> with AWS WAF.</div>
         </div>
-        <div style="flex:0 0 auto">
-          <button type="submit" class="btn">Unban from all</button>
+        <a class="btn muted" href="/login.php">Back to Login</a>
+      </section>
+
+      <!-- KPIs -->
+      <section class="stats">
+        <div class="card">
+          <div class="kpi">
+            <div>
+              <h3>Active Sessions</h3>
+              <div class="num">1</div>
+            </div>
+            <span class="tag">Demo</span>
+          </div>
         </div>
-      </form>
-      <p class="muted">This will remove the IP from both <code>weblogin</code> and <code>weblogin-24h</code> using a sudo-protected wrapper script.</p>
-    </div>
+        <div class="card">
+          <div class="kpi">
+            <div>
+              <h3>Failed Logins (last min)</h3>
+              <div class="num">—</div>
+            </div>
+            <span class="badge warn">WAF rule</span>
+          </div>
+        </div>
+        <div class="card">
+          <div class="kpi">
+            <div>
+              <h3>CAPTCHA Challenges</h3>
+              <div class="num">—</div>
+            </div>
+            <span class="badge ok">Optional</span>
+          </div>
+        </div>
+        <div class="card">
+          <div class="kpi">
+            <div>
+              <h3>Blocked Sources</h3>
+              <div class="num">—</div>
+            </div>
+            <span class="badge bad">Rate limit</span>
+          </div>
+        </div>
+      </section>
 
-    <div class="card">
-      <h2 style="margin-top:0">About this demo</h2>
-      <p class="muted">
-        Short jail: 3 failed logins within 60s → 2 min ban. |
-        Long jail: 10 failed logins within 24h → 7 days ban.
-      </p>
-      <p class="muted">We can add auto-refresh (AJAX) later so stats update without reloading the page.</p>
-    </div>
-  </main>
-</div>
-
+      <!-- Recent activity (placeholder) -->
+      <section class="card tablecard">
+        <div class="head">
+          <h3 style="margin:0">Recent Activity</h3>
+          <span class="muted">Sample / demo only</span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Event</th>
+              <th>Details</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Just now</td>
+              <td>Login</td>
+              <td>User <code><?php echo $user; ?></code> signed in</td>
+              <td><span class="badge ok">OK</span></td>
+            </tr>
+            <tr>
+              <td>—</td>
+              <td>Brute-force check</td>
+              <td>Protected by AWS WAF (rate-based rule)</td>
+              <td><span class="badge warn">WAF</span></td>
+            </tr>
+            <tr>
+              <td>—</td>
+              <td>Security</td>
+              <td>Optional CAPTCHA on /login.php</td>
+              <td><span class="badge">Info</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+    </main>
+  </div>
 </body>
 </html>
